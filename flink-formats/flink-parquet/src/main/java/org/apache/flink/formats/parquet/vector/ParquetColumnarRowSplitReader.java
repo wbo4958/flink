@@ -159,9 +159,11 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 
 		checkSchema();
 
-//		this.writableVectors = createWritableVectors();
-//		this.columnarBatch = generator.generate(createReadableVectors());
-//		this.row = new ColumnarRowData(columnarBatch);
+		if (!gpuSupport) {
+			this.writableVectors = createWritableVectors();
+			this.columnarBatch = generator.generate(createReadableVectors());
+			this.row = new ColumnarRowData(columnarBatch);
+		}
 
 		this.filePath = path;
 		this.conf = conf;
