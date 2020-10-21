@@ -18,6 +18,7 @@
 
 package org.apache.flink.formats.parquet.vector;
 
+import org.apache.flink.formats.parquet.GpuColumnVector;
 import org.apache.flink.formats.parquet.vector.reader.AbstractColumnReader;
 import org.apache.flink.formats.parquet.vector.reader.ColumnReader;
 import org.apache.flink.table.data.ColumnarRowData;
@@ -29,6 +30,7 @@ import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.apache.flink.util.FlinkRuntimeException;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.page.PageReadStore;
@@ -42,12 +44,21 @@ import org.apache.parquet.schema.Type;
 import org.apache.parquet.schema.Types;
 
 import java.io.Closeable;
+import java.io.File;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.stream.Collectors;
+
+import ai.rapids.cudf.DType;
+import ai.rapids.cudf.HostColumnVector;
+import ai.rapids.cudf.HostMemoryBuffer;
+import ai.rapids.cudf.ParquetOptions;
+import ai.rapids.cudf.Table;
 
 import static org.apache.flink.formats.parquet.vector.ParquetSplitReaderUtil.createColumnReader;
 import static org.apache.flink.formats.parquet.vector.ParquetSplitReaderUtil.createWritableColumnVector;
@@ -73,11 +84,11 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 	 */
 	private final long totalRowCount;
 
-	private final WritableColumnVector[] writableVectors;
+	private WritableColumnVector[] writableVectors;
 
-	private final VectorizedColumnBatch columnarBatch;
+	private VectorizedColumnBatch columnarBatch;
 
-	private final ColumnarRowData row;
+	private ColumnarRowData row;
 
 	private final LogicalType[] selectedTypes;
 
@@ -107,6 +118,10 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 	// the number of rows in the current batch
 	private int rowsInBatch;
 
+	private Path filePath;
+	private Configuration conf;
+	private boolean gpuSupporting = false;
+
 	public ParquetColumnarRowSplitReader(
 			boolean utcTimestamp,
 			boolean caseSensitive,
@@ -117,7 +132,8 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 			int batchSize,
 			Path path,
 			long splitStart,
-			long splitLength) throws IOException {
+			long splitLength,
+			boolean gpuSupport) throws IOException {
 		this.utcTimestamp = utcTimestamp;
 		this.selectedTypes = selectedTypes;
 		this.batchSize = batchSize;
@@ -143,9 +159,28 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 
 		checkSchema();
 
-		this.writableVectors = createWritableVectors();
-		this.columnarBatch = generator.generate(createReadableVectors());
-		this.row = new ColumnarRowData(columnarBatch);
+//		this.writableVectors = createWritableVectors();
+//		this.columnarBatch = generator.generate(createReadableVectors());
+//		this.row = new ColumnarRowData(columnarBatch);
+
+		this.filePath = path;
+		this.conf = conf;
+		this.gpuSupporting = gpuSupport;
+	}
+
+	public ParquetColumnarRowSplitReader(
+		boolean utcTimestamp,
+		boolean caseSensitive,
+		Configuration conf,
+		LogicalType[] selectedTypes,
+		String[] selectedFieldNames,
+		ColumnBatchGenerator generator,
+		int batchSize,
+		Path path,
+		long splitStart,
+		long splitLength) throws IOException {
+		this(utcTimestamp, caseSensitive, conf, selectedTypes, selectedFieldNames, generator,
+			batchSize, path, splitStart, splitLength, false);
 	}
 
 	/**
@@ -269,9 +304,44 @@ public class ParquetColumnarRowSplitReader implements Closeable {
 			// No more rows available in the Rows array.
 			nextRow = 0;
 			// Try to read the next batch if rows from the file.
+			if (gpuSupporting) {
+				return nextBatchForGpu();
+			}
 			return nextBatch();
 		}
 		// there is at least one Row left in the Rows array.
+		return true;
+	}
+
+	private boolean gpuHasNextBatch = true;
+	private boolean nextBatchForGpu() throws IOException {
+		// for the simplicity, read the whole file instead of Row Groups
+		// TODO the normal flow:
+		// read the row group and re-construct header, footer and call Table.readParquet
+
+		if (!gpuHasNextBatch) {
+			return false;
+		}
+		gpuHasNextBatch = false;
+
+		ParquetOptions parseOpts = ParquetOptions.builder()
+			.withTimeUnit(DType.TIMESTAMP_MICROSECONDS)
+			.includeColumn(
+				requestedSchema.getFields().stream()
+					.map(field -> field.getName())
+					.collect(Collectors.toList())).build();
+
+		long size = filePath.getFileSystem(conf).getFileStatus(filePath).getLen();
+
+		FSDataInputStream fsDataInputStream = filePath.getFileSystem(conf).open(filePath);
+		byte[] buffer = new byte[(int) size];
+		fsDataInputStream.readFully(0, buffer);
+
+		Table table = Table.readParquet(parseOpts, buffer);
+
+		columnarBatch = new VectorizedColumnBatch(GpuColumnVector.extractColumns(table));
+		row = new ColumnarRowData(columnarBatch);
+		rowsInBatch = (int) table.getRowCount();
 		return true;
 	}
 

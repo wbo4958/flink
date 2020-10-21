@@ -45,6 +45,13 @@ under the License.
 		</dependency>
 
 		<dependency>
+			<groupId>ai.rapids</groupId>
+			<artifactId>cudf</artifactId>
+			<version>0.16-SNAPSHOT</version>
+			<classifier>cuda10-1</classifier>
+		</dependency>
+
+		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-table-common</artifactId>
 			<version>${project.version}</version>
